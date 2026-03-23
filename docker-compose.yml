@@ -1,0 +1,121 @@
+version: '3.9'
+
+services:
+  # ─────────────────────────────────────────────────────────────
+  # Tourist Prediction API
+  # ─────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: tourist-prediction-api
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/app/models:ro
+      - ./mlruns:/app/mlruns:ro
+    environment:
+      - PYTHONPATH=/app
+      - LOG_LEVEL=INFO
+      - ENV=development
+    depends_on:
+      - mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - mlops-network
+
+  # ─────────────────────────────────────────────────────────────
+  # MLflow Tracking Server
+  # ─────────────────────────────────────────────────────────────
+  mlflow:
+    image: python:3.11-slim
+    container_name: mlflow-server
+    command: >
+      bash -c "pip install mlflow boto3 -q &&
+               mlflow server
+               --host 0.0.0.0
+               --port 5000
+               --backend-store-uri /mlruns
+               --default-artifact-root /mlruns"
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns
+    networks:
+      - mlops-network
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────────────────────
+  # Training Service (run once)
+  # ─────────────────────────────────────────────────────────────
+  trainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    container_name: tourist-model-trainer
+    command: python main.py
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./mlruns:/app/mlruns
+    environment:
+      - PYTHONPATH=/app
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - KAGGLE_USERNAME=${KAGGLE_USERNAME}
+      - KAGGLE_KEY=${KAGGLE_KEY}
+    depends_on:
+      - mlflow
+    profiles:
+      - training
+    networks:
+      - mlops-network
+
+  # ─────────────────────────────────────────────────────────────
+  # Prometheus (monitoring)
+  # ─────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - mlops-network
+    profiles:
+      - monitoring
+
+  # ─────────────────────────────────────────────────────────────
+  # Grafana (dashboards)
+  # ─────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=mlops123
+    depends_on:
+      - prometheus
+    networks:
+      - mlops-network
+    profiles:
+      - monitoring
+
+networks:
+  mlops-network:
+    driver: bridge
+
+volumes:
+  mlruns:
+  models:

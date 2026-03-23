@@ -1,0 +1,292 @@
+name: Tourist Prediction MLOps — CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_training:
+        description: 'Run model training'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: tourist-prediction-api
+  ECS_SERVICE: tourist-prediction-service-prod
+  ECS_CLUSTER: tourist-prediction-cluster-prod
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Job 1: Code Quality & Tests
+  # ──────────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Tests & Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov flake8 black isort
+
+      - name: Lint with flake8
+        run: |
+          flake8 src/ api/ --max-line-length=120 --ignore=E501,W503 --count
+
+      - name: Check formatting with black
+        run: black --check src/ api/ --line-length 120
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v --cov=src --cov=api --cov-report=xml --cov-report=term
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 2: Model Training (conditional)
+  # ──────────────────────────────────────────────────────────────
+  train:
+    name: 🤖 Train & Evaluate Models
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main' || github.event.inputs.run_training == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure Kaggle credentials
+        run: |
+          mkdir -p ~/.kaggle
+          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_API_KEY }}"}' > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Run data ingestion
+        run: python -c "from src.data_ingestion import load_and_save_data; load_and_save_data()"
+
+      - name: Run preprocessing
+        run: |
+          python -c "
+          from src.data_ingestion import load_and_save_data
+          from src.feature_engineering import run_preprocessing_pipeline
+          df = load_and_save_data()
+          run_preprocessing_pipeline(df)
+          "
+
+      - name: Train all 3 models + compare
+        run: |
+          python -c "
+          import pandas as pd
+          from src.data_ingestion import load_and_save_data
+          from src.feature_engineering import run_preprocessing_pipeline
+          from src.model_training import run_training_pipeline
+          df = load_and_save_data()
+          X_tr, X_v, X_te, y_tr, y_v, y_te, fe = run_preprocessing_pipeline(df)
+          models, results, comparison, best = run_training_pipeline(X_tr, X_v, X_te, y_tr, y_v, y_te)
+          print(f'Best model: {best}')
+          print(comparison.to_string())
+          "
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload model artifacts to S3
+        run: |
+          aws s3 sync models/ s3://tourist-prediction-models-${{ secrets.AWS_ACCOUNT_ID }}/models/${{ github.sha }}/
+          aws s3 sync mlruns/ s3://tourist-prediction-mlflow-${{ secrets.AWS_ACCOUNT_ID }}/mlruns/
+          echo "Models uploaded to S3"
+
+      - name: Store comparison results
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-comparison-results
+          path: models/results/
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 3: Build & Push Docker Image
+  # ──────────────────────────────────────────────────────────────
+  build:
+    name: 🐳 Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: github.ref == 'refs/heads/main'
+
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag & push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          LATEST_URI=$ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          docker build -t $IMAGE_URI -t $LATEST_URI .
+          docker push $IMAGE_URI
+          docker push $LATEST_URI
+
+          echo "image_uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "Built and pushed: $IMAGE_URI"
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 4: Deploy to AWS ECS
+  # ──────────────────────────────────────────────────────────────
+  deploy:
+    name: 🚀 Deploy to AWS ECS Fargate
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition tourist-prediction-task-prod \
+            --query taskDefinition > task-definition.json
+
+      - name: Update task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: tourist-prediction-api
+          image: ${{ needs.build.outputs.image_uri }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Verify deployment
+        run: |
+          echo "✅ Deployment successful!"
+          echo "Image: ${{ needs.build.outputs.image_uri }}"
+          echo "Service: ${{ env.ECS_SERVICE }}"
+          echo "Cluster: ${{ env.ECS_CLUSTER }}"
+
+  # ──────────────────────────────────────────────────────────────
+  # Job 5: Post-Deploy Smoke Tests
+  # ──────────────────────────────────────────────────────────────
+  smoke-test:
+    name: 💨 Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get ALB endpoint
+        run: |
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --stack-name TourismMLOpsStack \
+            --query 'Stacks[0].Outputs[?ExportName==`tourist-prediction-alb-dns`].OutputValue' \
+            --output text)
+          echo "API_URL=http://$ALB_DNS" >> $GITHUB_ENV
+
+      - name: Health check
+        run: |
+          curl -f "$API_URL/health" | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert data['status'] == 'healthy', 'Health check failed!'
+          print('✅ Health check passed')
+          "
+
+      - name: Prediction smoke test
+        run: |
+          curl -f -X POST "$API_URL/predict" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "year": 2024,
+              "month": 7,
+              "destination_country": "France",
+              "origin_country": "USA",
+              "season": "Summer",
+              "travel_type": "Leisure",
+              "avg_stay_days": 7.0,
+              "avg_expenditure_usd": 1500.0,
+              "hotel_rating": 4,
+              "advance_booking_days": 30,
+              "group_size": 2,
+              "gdp_per_capita_origin": 55000.0,
+              "distance_km": 7000.0,
+              "visa_required": 0,
+              "flight_cost_usd": 800.0,
+              "tourism_index": 85.0,
+              "prev_year_visitors_million": 50.0,
+              "repeat_visitor": 0,
+              "digital_booking": 1,
+              "satisfaction_score": 4
+            }' | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          assert 'prediction' in data, 'No prediction in response!'
+          print(f'✅ Prediction: {data[\"prediction_label\"]} ({data[\"confidence\"]:.2%} confidence)')
+          "
